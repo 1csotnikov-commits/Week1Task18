@@ -19,7 +19,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import mcp_types as types
 
@@ -145,18 +145,19 @@ class MCPApp:
         )
 
 
-def create_app() -> MCPApp:
+def create_app(notification_callback: Callable[[str], None] | None = None) -> MCPApp:
     """Создаёт приложение с настройками по умолчанию.
 
     Транслирует ``GIT_REPO_PATH`` (если задан) в окружение подпроцесса сервера,
-    чтобы инструменты видели нужный репозиторий.
+    чтобы инструменты видели нужный репозиторий. ``notification_callback``
+    вызывается при получении push-уведомлений от сервера.
     """
     env: dict[str, str] = {}
     repo_path = os.environ.get(GIT_REPO_PATH_ENV)
     if repo_path:
         env[GIT_REPO_PATH_ENV] = repo_path
 
-    session = MCPSession(env=env or None)
+    session = MCPSession(env=env or None, notification_callback=notification_callback)
     return MCPApp(session)
 
 

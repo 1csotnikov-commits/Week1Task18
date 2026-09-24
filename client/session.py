@@ -17,8 +17,9 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import mcp_types as types
 from mcp import ClientSession, StdioServerParameters
@@ -45,6 +46,7 @@ class MCPSession:
         args: list[str] | None = None,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
+        notification_callback: Callable[[str], None] | None = None,
     ) -> None:
         self._params = StdioServerParameters(
             command=command,
@@ -52,6 +54,7 @@ class MCPSession:
             cwd=cwd if cwd is not None else PROJECT_ROOT,
             env=env,
         )
+        self._notification_callback = notification_callback
         self._session: ClientSession | None = None
         self._stdio_ctx = None
         self._session_ctx = None
@@ -89,7 +92,11 @@ class MCPSession:
             raise
 
         try:
-            self._session_ctx = ClientSession(read_stream, write_stream)
+            self._session_ctx = ClientSession(
+                read_stream,
+                write_stream,
+                logging_callback=self._logging_callback,
+            )
             self._session = await self._session_ctx.__aenter__()
             self._initialize_result = await self._session.initialize()
         except BaseException:
@@ -133,3 +140,12 @@ class MCPSession:
     def _ensure_connected(self) -> None:
         if not self.is_connected:
             raise ConnectionError("Нет активного MCP-соединения. Сначала выполните подключение.")
+
+    async def _logging_callback(self, params: types.LoggingMessageNotificationParams) -> None:
+        """Обрабатывает ``notifications/message`` от сервера (push-уведомления)."""
+        if self._notification_callback is None:
+            return
+        data = params.data
+        if not isinstance(data, str):
+            data = json.dumps(data, ensure_ascii=False, default=str)
+        self._notification_callback(data)

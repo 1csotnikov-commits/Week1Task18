@@ -15,6 +15,10 @@
     "provider": "deepseek",
     "model": "deepseek-chat",
     "api_key_env": "DEEPSEEK_API_KEY"
+  },
+  "scheduler": {
+    "db_path": "scheduler.db",
+    "db_path_env": "SCHEDULER_DB_PATH"
   }
 }
 

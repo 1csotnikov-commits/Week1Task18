@@ -16,10 +16,18 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
+from contextlib import asynccontextmanager
+from datetime import timedelta
 from typing import Annotated, Any
 
 from mcp.server.mcpserver import MCPServer
 from pydantic import Field
+
+from scheduler import AppContext
+from scheduler.db import Database, now_iso, now_utc, to_utc_iso
+from scheduler.scheduler import Scheduler
+from scheduler.summary import get_summary as summarize
 
 # httpx логирует каждый HTTP-запрос на уровне INFO и засоряет stderr сервера;
 # оставляем только предупреждения и ошибки.
@@ -248,11 +256,36 @@ def _format_forecast(city_display: str, daily: dict[str, Any], units: str) -> st
     return "\n".join(lines)
 
 
+# --- Планировщик (псевдо-24/7) ---
+
+db = Database()
+app_context = AppContext(db)
+
+
+async def _capture_session_middleware(ctx, call_next):
+    """Захватывает сессию для фоновых push-уведомлений (первый входящий запрос)."""
+    app_context.set_session(ctx.session)
+    return await call_next(ctx)
+
+
+@asynccontextmanager
+async def _lifespan(app):
+    """Запускает фоновый планировщик на время жизни сервера."""
+    scheduler = Scheduler(db, app_context)
+    scheduler.start()
+    try:
+        yield app_context
+    finally:
+        await scheduler.stop()
+
+
 server = MCPServer(
     name="git-mcp-server",
     title="Git MCP Server",
-    description="MCP-сервер, предоставляющий инструменты для работы с локальным Git-репозиторием.",
+    description="MCP-сервер: Git, погода и планировщик задач (псевдо-24/7).",
     version="0.1.0",
+    middleware=[_capture_session_middleware],
+    lifespan=_lifespan,
 )
 
 
@@ -398,6 +431,164 @@ def get_forecast(
         return f"Непредвиденная ошибка: {exc}"
 
 
+@server.tool()
+def schedule_reminder(
+    text: Annotated[str, Field(description="Текст напоминания")],
+    at: Annotated[str | None, Field(description="Когда напомнить (ISO 8601)")] = None,
+    in_minutes: Annotated[int | None, Field(description="Через сколько минут напомнить (альтернатива at)")] = None,
+    interval_seconds: Annotated[int | None, Field(description="Если задано — напоминание периодическое (период в секундах)")] = None,
+) -> dict[str, Any]:
+    """Создаёт разовое или периодическое напоминание. Возвращает id задачи."""
+    try:
+        if not text or not text.strip():
+            return {"error": "Некорректный параметр: текст напоминания не может быть пустым."}
+        if at is not None and in_minutes is not None:
+            return {"error": "Некорректный параметр: укажите либо at, либо in_minutes."}
+        if in_minutes is not None and in_minutes <= 0:
+            return {"error": "Некорректный параметр: in_minutes должен быть положительным."}
+        if interval_seconds is not None and interval_seconds <= 0:
+            return {"error": "Некорректный параметр: interval_seconds должен быть положительным."}
+
+        if at:
+            next_run = to_utc_iso(at)
+        elif in_minutes is not None:
+            next_run = (now_utc() + timedelta(minutes=in_minutes)).isoformat()
+        else:
+            next_run = now_iso()
+
+        schedule_id = db.create_schedule(
+            "reminder",
+            {"text": text.strip()},
+            next_run_at=next_run,
+            interval_seconds=interval_seconds or None,
+            run_at=to_utc_iso(at) if at else None,
+        )
+        return {"id": schedule_id, "next_run_at": next_run}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"Некорректный параметр: {exc}"}
+
+
+@server.tool()
+def schedule_weather_collection(
+    city: Annotated[str, Field(description="Название города (например, Moscow)")],
+    interval_minutes: Annotated[int, Field(description="Период сбора в минутах (минимум 1)")],
+    units: Annotated[str, Field(description="Единицы измерения: metric или imperial")] = "metric",
+) -> dict[str, Any]:
+    """Создаёт периодический сбор погоды для города. Возвращает id задачи."""
+    try:
+        if not city or not city.strip():
+            return {"error": "Некорректный параметр: город не может быть пустым."}
+        if interval_minutes < 1:
+            return {"error": "Некорректный параметр: interval_minutes должен быть не меньше 1."}
+        if units not in ("metric", "imperial"):
+            return {"error": "Некорректный параметр: units должен быть 'metric' или 'imperial'."}
+
+        now = now_iso()
+        schedule_id = db.create_schedule(
+            "weather_collection",
+            {"city": city.strip(), "units": units},
+            next_run_at=now,
+            interval_seconds=interval_minutes * 60,
+        )
+        return {"id": schedule_id, "next_run_at": now}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+
+
+@server.tool()
+def list_schedules(
+    status: Annotated[str | None, Field(description="Фильтр по статусу: active, paused, cancelled, completed")] = None,
+) -> list[dict[str, Any]]:
+    """Возвращает список всех запланированных задач со статусом и временем следующего запуска."""
+    try:
+        return db.list_schedules(status or None)
+    except Exception as exc:  # noqa: BLE001
+        return [{"error": str(exc)}]
+
+
+@server.tool()
+def cancel_schedule(
+    schedule_id: Annotated[str, Field(description="Идентификатор задачи")],
+) -> dict[str, Any]:
+    """Отменяет задачу по id (status = 'cancelled')."""
+    try:
+        if db.get_schedule(schedule_id) is None:
+            return {"error": f"Задача {schedule_id} не найдена."}
+        db.set_status(schedule_id, "cancelled")
+        return {"id": schedule_id, "status": "cancelled"}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+
+
+@server.tool()
+def pause_schedule(
+    schedule_id: Annotated[str, Field(description="Идентификатор задачи")],
+) -> dict[str, Any]:
+    """Ставит задачу на паузу (status = 'paused')."""
+    try:
+        if db.get_schedule(schedule_id) is None:
+            return {"error": f"Задача {schedule_id} не найдена."}
+        db.set_status(schedule_id, "paused")
+        return {"id": schedule_id, "status": "paused"}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+
+
+@server.tool()
+def resume_schedule(
+    schedule_id: Annotated[str, Field(description="Идентификатор задачи")],
+) -> dict[str, Any]:
+    """Снимает задачу с паузы (status = 'active')."""
+    try:
+        if db.get_schedule(schedule_id) is None:
+            return {"error": f"Задача {schedule_id} не найдена."}
+        db.set_status(schedule_id, "active")
+        return {"id": schedule_id, "status": "active"}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+
+
+@server.tool()
+def get_summary(
+    city: Annotated[str | None, Field(description="Город (опционально)")] = None,
+    days: Annotated[int, Field(description="За сколько дней (по умолчанию 1)")] = 1,
+    include_reminders: Annotated[bool, Field(description="Включить сводку по сработавшим напоминаниям")] = False,
+    include_all_cities: Annotated[bool, Field(description="По всем городам")] = False,
+) -> dict[str, Any]:
+    """Возвращает агрегированные данные по собранной погоде + текстовое summary от LLM."""
+    try:
+        if days < 1:
+            return {"error": "Некорректный параметр: days должен быть не меньше 1."}
+        return summarize(
+            db,
+            city=city or None,
+            days=days,
+            include_reminders=include_reminders,
+            include_all_cities=include_all_cities,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+
+
+@server.tool()
+def get_due_results(
+    since: Annotated[str | None, Field(description="С какого времени (ISO 8601)")] = None,
+) -> dict[str, Any]:
+    """Возвращает результаты и неотвеченные события, отмечая события прочитанными."""
+    try:
+        results = db.list_results(since or None)
+        events = db.list_events(acknowledged=0, since=since or None)
+        db.acknowledge_events([e["id"] for e in events])
+        return {"results": results, "events": events}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+
+
 if __name__ == "__main__":
+    # UTF-8 для stderr (логи), чтобы кириллица не ломалась при перенаправлении.
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+
     # stdio — единственный используемый транспорт.
     server.run(transport="stdio")
