@@ -25,8 +25,13 @@ import mcp_types as types
 
 from client.session import MCPSession
 
-#: Имя переменной окружения, транслируемой в подпроцесс сервера.
+#: Имя переменной окружения, задающей Git-репозиторий по умолчанию.
 GIT_REPO_PATH_ENV = "GIT_REPO_PATH"
+
+#: Переменные окружения, которые клиент транслирует в подпроцесс сервера.
+#: Серверу нужны: GIT_REPO_PATH (Git), DEEPSEEK_API_KEY (LLM для /summary),
+#: SCHEDULER_DB_PATH (путь к БД планировщика).
+FORWARDED_ENV_VARS = ("GIT_REPO_PATH", "DEEPSEEK_API_KEY", "SCHEDULER_DB_PATH")
 
 
 @dataclass
@@ -148,14 +153,15 @@ class MCPApp:
 def create_app(notification_callback: Callable[[str], None] | None = None) -> MCPApp:
     """Создаёт приложение с настройками по умолчанию.
 
-    Транслирует ``GIT_REPO_PATH`` (если задан) в окружение подпроцесса сервера,
-    чтобы инструменты видели нужный репозиторий. ``notification_callback``
-    вызывается при получении push-уведомлений от сервера.
+    Транслирует нужные серверу переменные окружения (``GIT_REPO_PATH``,
+    ``DEEPSEEK_API_KEY``, ``SCHEDULER_DB_PATH``) в подпроцесс сервера.
+    ``notification_callback`` вызывается при получении push-уведомлений.
     """
     env: dict[str, str] = {}
-    repo_path = os.environ.get(GIT_REPO_PATH_ENV)
-    if repo_path:
-        env[GIT_REPO_PATH_ENV] = repo_path
+    for name in FORWARDED_ENV_VARS:
+        value = os.environ.get(name)
+        if value:
+            env[name] = value
 
     session = MCPSession(env=env or None, notification_callback=notification_callback)
     return MCPApp(session)
