@@ -6,5 +6,15 @@
   },
   "client": {
     "interactive": true
+  },
+  "weather": {
+    "provider": "open-meteo",
+    "api_key_required": false
+  },
+  "llm": {
+    "provider": "deepseek",
+    "model": "deepseek-chat",
+    "api_key_env": "DEEPSEEK_API_KEY"
   }
 }
+

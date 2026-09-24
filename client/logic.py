@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -102,6 +103,34 @@ class MCPApp:
         result = await self._session.call_tool(name, arguments)
         self._last_call_time = time.time()
         return format_call_result(result)
+
+    async def get_weather(self, city: str, days: int | None = None, units: str = "metric") -> str:
+        """Вызывает погодный инструмент (текущая погода или прогноз) и возвращает текст.
+
+        Если ``days`` не задан — вызывается ``get_current_weather``, иначе ``get_forecast``.
+        """
+        if days is not None:
+            return await self.call_tool("get_forecast", {"city": city, "days": days, "units": units})
+        return await self.call_tool("get_current_weather", {"city": city, "units": units})
+
+    async def ask_weather(self, city: str, question: str | None = None) -> str:
+        """Получает данные о погоде через MCP и передаёт их в LLM для формирования ответа.
+
+        Это точка расширения под автономный tool use: данные инструмента подаются
+        модели вместе с вопросом пользователя, модель формирует текстовый ответ.
+        """
+        from llm.provider import ask
+
+        data = await self.get_weather(city)
+        if question:
+            prompt = (
+                f"Данные о погоде: {data}\n\n"
+                f"Вопрос пользователя: {question}\n\n"
+                "Ответь, используя эти данные."
+            )
+        else:
+            prompt = f"Данные о погоде: {data}\n\nОпиши текущую погоду и дай рекомендацию по одежде."
+        return await asyncio.to_thread(ask, prompt)
 
     async def status(self) -> StatusInfo:
         """Формирует снимок состояния клиента."""

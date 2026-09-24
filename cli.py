@@ -27,6 +27,8 @@ COMMANDS: dict[str, str] = {
     "/help": "показать список всех команд с описанием",
     "/tools": "повторно запросить у MCP-сервера список инструментов и вывести его",
     "/call": "вызвать инструмент MCP вручную (например: /call git_status или /call git_log limit=5)",
+    "/weather": "показать погоду: /weather <city> [--days N] [--units metric|imperial]",
+    "/ask-weather": "спросить агента о погоде: /ask-weather <city> [вопрос] (через LLM)",
     "/status": "показать состояние MCP-соединения: подключение, имя сервера, версию протокола, инструменты, время последнего вызова",
     "/reconnect": "переустановить MCP-соединение: закрыть сессию, перезапустить сервер, initialize и заново получить инструменты",
     "/exit": "выйти из программы с корректным закрытием MCP-соединения (синоним: /quit)",
@@ -41,7 +43,7 @@ def print_help() -> None:
     """Выводит список всех команд CLI с описанием."""
     print("Доступные команды:")
     for command in COMMANDS:
-        print(f"  {command:<10} — {COMMANDS[command]}")
+        print(f"  {command:<12} — {COMMANDS[command]}")
 
 
 def split_args(text: str) -> list[str]:
@@ -114,6 +116,84 @@ async def handle_call(app: MCPApp, tokens: list[str]) -> None:
     print(result)
 
 
+def parse_weather_args(tokens: list[str]) -> tuple[str, int | None, str]:
+    """Разбирает аргументы команды ``/weather <city> [--days N] [--units metric|imperial]``."""
+    city_parts: list[str] = []
+    days: int | None = None
+    units = "metric"
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        if token == "--days":
+            if i + 1 >= len(tokens):
+                raise ValueError("флаг --days требует значение (например, --days 5)")
+            try:
+                days = int(tokens[i + 1])
+            except ValueError as exc:
+                raise ValueError("значение --days должно быть целым числом") from exc
+            i += 2
+        elif token == "--units":
+            if i + 1 >= len(tokens):
+                raise ValueError("флаг --units требует значение (metric или imperial)")
+            units = tokens[i + 1]
+            i += 2
+        elif token.startswith("--"):
+            raise ValueError(f"неизвестный флаг: {token}")
+        else:
+            city_parts.append(token)
+            i += 1
+
+    city = " ".join(city_parts).strip()
+    if not city:
+        raise ValueError("укажите название города. Пример: /weather Moscow")
+    return city, days, units
+
+
+def parse_ask_weather_args(tokens: list[str]) -> tuple[str, str | None]:
+    """Разбирает аргументы команды ``/ask-weather <city> [вопрос]``."""
+    if not tokens:
+        raise ValueError("укажите название города. Пример: /ask-weather Moscow")
+    city = tokens[0]
+    question = " ".join(tokens[1:]).strip() or None
+    return city, question
+
+
+async def handle_weather(app: MCPApp, tokens: list[str]) -> None:
+    """Обрабатывает команду ``/weather <city> [--days N] [--units ...]``."""
+    try:
+        city, days, units = parse_weather_args(tokens)
+    except ValueError as exc:
+        print(f"Ошибка: {exc}")
+        return
+
+    try:
+        result = await app.get_weather(city, days, units)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Ошибка при вызове погодного инструмента: {exc}")
+        return
+
+    print(result)
+
+
+async def handle_ask_weather(app: MCPApp, tokens: list[str]) -> None:
+    """Обрабатывает команду ``/ask-weather <city> [вопрос]`` (через LLM)."""
+    try:
+        city, question = parse_ask_weather_args(tokens)
+    except ValueError as exc:
+        print(f"Ошибка: {exc}")
+        return
+
+    print("Получение данных о погоде...")
+    try:
+        answer = await app.ask_weather(city, question)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Ошибка: {exc}")
+        return
+
+    print("=== Ответ агента ===")
+    print(answer)
+
+
 async def run_once(app: MCPApp) -> None:
     """Одноразовый режим: подключиться, вывести инструменты и результат git_status, выйти."""
     await app.connect()
@@ -170,6 +250,10 @@ async def run_interactive(app: MCPApp) -> None:
                 print(f"Ошибка при получении списка инструментов: {exc}")
         elif command == "/call":
             await handle_call(app, tokens[1:])
+        elif command == "/weather":
+            await handle_weather(app, tokens[1:])
+        elif command == "/ask-weather":
+            await handle_ask_weather(app, tokens[1:])
         elif command == "/status":
             print(format_status(await app.status()))
         elif command == "/reconnect":
@@ -190,7 +274,7 @@ async def run_interactive(app: MCPApp) -> None:
 def main() -> None:
     """Точка входа."""
     parser = argparse.ArgumentParser(
-        description="MCP-клиент для Git-сервера (транспорт stdio)."
+        description="MCP-клиент (транспорт stdio)."
     )
     parser.add_argument(
         "--once",
