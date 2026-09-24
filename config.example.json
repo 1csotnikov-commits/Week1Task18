@@ -1,0 +1,10 @@
+{
+  "git_repo_path": "C:/path/to/your/repository",
+  "server": {
+    "command": "python",
+    "args": ["mcp_server.py"]
+  },
+  "client": {
+    "interactive": true
+  }
+}
